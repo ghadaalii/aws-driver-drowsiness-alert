@@ -1,0 +1,627 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Car Drowsiness Alert System Infrastructure (Free Tier Optimized)
+  
+  Tables:
+  1. DriversTable: Stores driver profiles with medical info
+  2. AlertsTable: Stores drowsiness alerts with driver info
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+Resources:
+  # IoT Core Policy (Free Tier: 250,000 messages/month)
+  DrowsinessAlertPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub "drowsiness-alert-policy-${Environment}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iot:Connect'
+              - 'iot:Publish'
+              - 'iot:Subscribe'
+              - 'iot:Receive'
+            Resource: '*'
+
+  # DynamoDB Tables (Free Tier: 25 WCU and 25 RCU)
+  DriversTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "drivers-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: FreeTier
+          Value: "true"
+        - Key: Purpose
+          Value: "Driver Profiles"
+        - Key: DataClassification
+          Value: "Sensitive"
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "drowsiness_alerts-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alert_id
+          AttributeType: S
+        - AttributeName: driver_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alert_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: driver_id-timestamp-index
+          KeySchema:
+            - AttributeName: driver_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: FreeTier
+          Value: "true"
+        - Key: Purpose
+          Value: "Drowsiness Alerts"
+        - Key: DataClassification
+          Value: "Sensitive"
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DrowsinessAlertLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: 
+                  - !GetAtt DriversTable.Arn
+                  - !GetAtt AlertsTable.Arn
+                  - !Sub "${AlertsTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - 'iot:Publish'
+                  - 'iot:Connect'
+                Resource: '*'
+
+  # Lambda Functions
+  UpdateDriverProfileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "update_driver_profile-${Environment}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          DRIVERS_TABLE: !Ref DriversTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime, timedelta
+          import os
+          import logging
+          import re
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS services
+          dynamodb = boto3.resource('dynamodb')
+
+          # Get table names from environment variables
+          DRIVERS_TABLE = os.environ.get('DRIVERS_TABLE', 'drivers')
+
+          def validate_name(name):
+              """Validate driver name"""
+              if not name or not isinstance(name, str):
+                  return None, "Name must be a non-empty string"
+              
+              # Remove special characters and extra spaces
+              name = re.sub(r'[^a-zA-Z\s\-\.]', '', name)
+              name = ' '.join(name.split())
+              
+              if len(name) < 2:
+                  return None, "Name must be at least 2 characters long"
+              if len(name) > 100:
+                  return None, "Name must not exceed 100 characters"
+              
+              return name, None
+
+          def validate_gender(gender):
+              """Validate gender"""
+              if not gender or not isinstance(gender, str):
+                  return None, "Gender must be a non-empty string"
+              
+              gender = gender.strip().lower()
+              valid_genders = ['male', 'female', 'other', 'm', 'f', 'o']
+              
+              # Map short forms to full forms
+              gender_map = {'m': 'male', 'f': 'female', 'o': 'other'}
+              gender = gender_map.get(gender, gender)
+              
+              if gender not in ['male', 'female', 'other']:
+                  return None, "Gender must be one of: male, female, other"
+              
+              return gender, None
+
+          def validate_date_of_birth(dob):
+              """Validate date of birth"""
+              if not dob or not isinstance(dob, str):
+                  return None, "Date of birth must be a non-empty string in YYYY-MM-DD format"
+              
+              try:
+                  dob_date = datetime.strptime(dob, '%Y-%m-%d')
+                  today = datetime.now()
+                  
+                  # Check if date is in the future
+                  if dob_date > today:
+                      return None, "Date of birth cannot be in the future"
+                  
+                  # Calculate age
+                  age = (today - dob_date).days / 365.25
+                  
+                  if age < 16:
+                      return None, "Driver must be at least 16 years old"
+                  if age > 100:
+                      return None, "Invalid date of birth (age over 100)"
+                  
+                  return dob, None
+              except ValueError:
+                  return None, "Invalid date format. Use YYYY-MM-DD"
+
+          def validate_weight(weight):
+              """Validate weight in kg"""
+              if weight is None:
+                  return None, "Weight is required"
+              
+              try:
+                  weight = float(weight)
+                  if weight < 20:
+                      return None, "Weight must be at least 20 kg"
+                  if weight > 300:
+                      return None, "Weight must not exceed 300 kg"
+                  return round(weight, 1), None  # Round to 1 decimal place
+              except (ValueError, TypeError):
+                  return None, "Weight must be a valid number"
+
+          def validate_height(height):
+              """Validate height in cm"""
+              if height is None:
+                  return None, "Height is required"
+              
+              try:
+                  height = float(height)
+                  if height < 100:
+                      return None, "Height must be at least 100 cm"
+                  if height > 250:
+                      return None, "Height must not exceed 250 cm"
+                  return round(height, 1), None  # Round to 1 decimal place
+              except (ValueError, TypeError):
+                  return None, "Height must be a valid number"
+
+          def validate_emergency_contact(contact):
+              """Validate emergency contact phone number"""
+              if not contact or not isinstance(contact, str):
+                  return None, "Emergency contact is required"
+              
+              # Remove all non-digit characters
+              digits = re.sub(r'\D', '', contact)
+              
+              # Validate length
+              if len(digits) < 10:
+                  return None, "Emergency contact must have at least 10 digits"
+              if len(digits) > 15:
+                  return None, "Emergency contact must not exceed 15 digits"
+              
+              # Format the number
+              if len(digits) == 10:
+                  return f"+1{digits}", None  # Add country code for 10-digit numbers
+              return f"+{digits}", None
+
+          def validate_blood_type(blood_type):
+              """Validate blood type"""
+              if not blood_type or not isinstance(blood_type, str):
+                  return None, "Blood type is required"
+              
+              blood_type = blood_type.strip().upper()
+              valid_types = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+              
+              if blood_type not in valid_types:
+                  return None, f"Blood type must be one of: {', '.join(valid_types)}"
+              
+              return blood_type, None
+
+          def validate_chronic_diseases(diseases):
+              """Validate chronic diseases list"""
+              if not diseases:
+                  return [], None
+              
+              if not isinstance(diseases, list):
+                  return None, "Chronic diseases must be a list"
+              
+              valid_diseases = []
+              for disease in diseases:
+                  if not isinstance(disease, str):
+                      continue
+                  
+                  # Sanitize disease name
+                  disease = re.sub(r'[^a-zA-Z\s\-]', '', disease)
+                  disease = ' '.join(disease.split())
+                  
+                  if disease and len(disease) <= 100:
+                      valid_diseases.append(disease)
+              
+              if len(valid_diseases) > 20:
+                  return None, "Maximum 20 chronic diseases allowed"
+              
+              return valid_diseases, None
+
+          def validate_allergies(allergies):
+              """Validate allergies list"""
+              if not allergies:
+                  return [], None
+              
+              if not isinstance(allergies, list):
+                  return None, "Allergies must be a list"
+              
+              valid_allergies = []
+              for allergy in allergies:
+                  if not isinstance(allergy, str):
+                      continue
+                  
+                  # Sanitize allergy name
+                  allergy = re.sub(r'[^a-zA-Z\s\-]', '', allergy)
+                  allergy = ' '.join(allergy.split())
+                  
+                  if allergy and len(allergy) <= 50:
+                      valid_allergies.append(allergy)
+              
+              if len(valid_allergies) > 30:
+                  return None, "Maximum 30 allergies allowed"
+              
+              return valid_allergies, None
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to handle driver profile updates.
+              When a driver updates their profile via the infotainment system,
+              this function updates the record in DynamoDB.
+              """
+              logger.info(f"Received driver profile update: {json.dumps(event)}")
+              
+              drivers_table = dynamodb.Table(DRIVERS_TABLE)
+              
+              try:
+                  driver_id = event.get('id')
+                  if not driver_id:
+                      raise ValueError("Update missing id")
+                  
+                  ttl = int((datetime.utcnow() + timedelta(days=365)).timestamp())
+                  
+                  # Validate all fields
+                  validation_results = {
+                      'id': (driver_id, None),
+                      'name': validate_name(event.get('name')),
+                      'gender': validate_gender(event.get('gender')),
+                      'date_of_birth': validate_date_of_birth(event.get('date_of_birth')),
+                      'weight': validate_weight(event.get('weight')),
+                      'height': validate_height(event.get('height')),
+                      'emergency_contact': validate_emergency_contact(event.get('emergency_contact')),
+                      'blood_type': validate_blood_type(event.get('blood_type')),
+                      'chronic_diseases': validate_chronic_diseases(event.get('chronic_diseases', [])),
+                      'allergies': validate_allergies(event.get('allergies', [])),
+                      'last_updated': (datetime.utcnow().isoformat(), None),
+                      'ttl': (ttl, None)
+                  }
+                  
+                  # Check for validation errors
+                  errors = {k: v[1] for k, v in validation_results.items() if v[1] is not None}
+                  if errors:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'message': 'Validation errors',
+                              'errors': errors
+                          })
+                      }
+                  
+                  # Create update data with validated values
+                  update_data = {k: v[0] for k, v in validation_results.items() if v[0] is not None}
+                  
+                  drivers_table.put_item(Item=update_data)
+                  
+                  logger.info(f"Successfully updated driver profile for {driver_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Driver profile updated successfully',
+                          'id': driver_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error updating driver profile: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': f'Error updating profile: {str(e)}'
+                      })
+                  }
+
+  ProcessDrowsinessAlertFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "process_drowsiness_alert-${Environment}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          DRIVERS_TABLE: !Ref DriversTable
+          ALERTS_TABLE: !Ref AlertsTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime, timedelta
+          import os
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS services
+          dynamodb = boto3.resource('dynamodb')
+          iot_client = boto3.client('iot-data')
+
+          # Get table names from environment variables
+          DRIVERS_TABLE = os.environ.get('DRIVERS_TABLE', 'drivers')
+          ALERTS_TABLE = os.environ.get('ALERTS_TABLE', 'drowsiness_alerts')
+
+          def validate_drowsiness_level(level):
+              """Validate drowsiness level"""
+              if level is None:
+                  return 0
+              try:
+                  level = float(level)
+                  if 0 <= level <= 1:
+                      return level
+                  return 0
+              except (ValueError, TypeError):
+                  return 0
+
+          def validate_confidence(confidence):
+              """Validate confidence score"""
+              if confidence is None:
+                  return 0
+              try:
+                  confidence = float(confidence)
+                  if 0 <= confidence <= 1:
+                      return confidence
+                  return 0
+              except (ValueError, TypeError):
+                  return 0
+
+          def validate_location(location):
+              """Validate location coordinates"""
+              if not location or not isinstance(location, dict):
+                  return {}
+              
+              valid_location = {}
+              
+              try:
+                  lat = float(location.get('latitude', 0))
+                  lng = float(location.get('longitude', 0))
+                  if -90 <= lat <= 90 and -180 <= lng <= 180:
+                      valid_location['latitude'] = lat
+                      valid_location['longitude'] = lng
+              except (ValueError, TypeError):
+                  pass
+              
+              return valid_location
+
+          def validate_speed(speed):
+              """Validate vehicle speed"""
+              if speed is None:
+                  return 0
+              try:
+                  speed = float(speed)
+                  if 0 <= speed <= 300:  # Assuming max speed is 300 km/h
+                      return speed
+                  return 0
+              except (ValueError, TypeError):
+                  return 0
+
+          def lambda_handler(event, context):
+              """
+              Lambda function triggered by AWS IoT Core when a drowsiness alert is received.
+              This function:
+              1. Receives the alert from the vehicle
+              2. Retrieves the driver's information from DynamoDB
+              3. Combines the data
+              4. Stores the alert in DynamoDB
+              5. Publishes the combined data to the ambulance dashboard
+              """
+              logger.info(f"Received drowsiness alert: {json.dumps(event)}")
+              
+              drivers_table = dynamodb.Table(DRIVERS_TABLE)
+              alerts_table = dynamodb.Table(ALERTS_TABLE)
+              
+              try:
+                  driver_id = event.get('driver_id')
+                  if not driver_id:
+                      raise ValueError("Alert missing driver_id")
+                  
+                  alert_id = str(uuid.uuid4())
+                  timestamp = event.get('timestamp', datetime.utcnow().isoformat())
+                  ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+                  
+                  # Validate all fields
+                  alert_record = {
+                      'alert_id': alert_id,
+                      'driver_id': driver_id,
+                      'timestamp': timestamp,
+                      'drowsiness_level': validate_drowsiness_level(event.get('drowsiness_level')),
+                      'confidence': validate_confidence(event.get('confidence')),
+                      'location': validate_location(event.get('location', {})),
+                      'speed': validate_speed(event.get('speed')),
+                      'processed': True,
+                      'ttl': ttl
+                  }
+                  
+                  # Get driver information
+                  driver_response = drivers_table.get_item(
+                      Key={'id': driver_id}
+                  )
+                  
+                  if 'Item' not in driver_response:
+                      logger.warning(f"Driver with ID {driver_id} not found in database")
+                      driver_info = {
+                          'id': driver_id,
+                          'name': 'Unknown Driver',
+                          'car_info': {'vehicle': 'Unknown Vehicle'}
+                      }
+                  else:
+                      driver_info = driver_response['Item']
+                  
+                  # Store alert in DynamoDB
+                  alerts_table.put_item(Item=alert_record)
+                  
+                  # Prepare complete alert for ambulance dashboard
+                  complete_alert = {
+                      'alert': alert_record,
+                      'driver_info': driver_info
+                  }
+                  
+                  # Publish to ambulance dashboard
+                  iot_client.publish(
+                      topic='ambulance/alerts/drowsiness',
+                      qos=1,
+                      payload=json.dumps(complete_alert)
+                  )
+                  
+                  logger.info(f"Published alert to ambulance dashboard: {json.dumps(complete_alert)}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Alert processed successfully',
+                          'alert_id': alert_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing drowsiness alert: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': f'Error processing alert: {str(e)}'
+                      })
+                  }
+
+  # IoT Rules
+  DrowsinessAlertRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub drowsiness_alert_rule_${Environment}
+      TopicRulePayload:
+        RuleDisabled: false
+        Sql: !Sub "SELECT * FROM 'vehicle/alerts/drowsiness'"
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt ProcessDrowsinessAlertFunction.Arn
+
+  DriverProfileRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub driver_profile_${Environment}
+      TopicRulePayload:
+        RuleDisabled: false
+        Sql: !Sub "SELECT * FROM 'vehicle/driver/profile'"
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt UpdateDriverProfileFunction.Arn
+
+Outputs:
+  DriversTableName:
+    Description: Name of the DynamoDB table for driver profiles
+    Value: !Ref DriversTable
+
+  AlertsTableName:
+    Description: Name of the DynamoDB table for drowsiness alerts
+    Value: !Ref AlertsTable
+
+  UpdateDriverProfileFunctionArn:
+    Description: ARN of the Lambda function for updating driver profiles
+    Value: !GetAtt UpdateDriverProfileFunction.Arn
+
+  ProcessDrowsinessAlertFunctionArn:
+    Description: ARN of the Lambda function for processing drowsiness alerts
+    Value: !GetAtt ProcessDrowsinessAlertFunction.Arn
+
+  IotPolicyName:
+    Description: Name of the IoT policy
+    Value: !Ref DrowsinessAlertPolicy 
