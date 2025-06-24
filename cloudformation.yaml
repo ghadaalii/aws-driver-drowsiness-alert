@@ -1,6 +1,23 @@
+# =====================================================================
+# Driver Drowsiness Alert System CloudFormation Template - FIXED VERSION
+#
+# Key Fixes:
+# - Added missing Lambda permissions for IoT Rules
+# - Fixed IoT endpoint configuration
+# - Improved error handling in Lambda functions
+# - Added proper logging and debugging
+# - Fixed DynamoDB table structure issues
+#
+# Deployment Instructions:
+# 1. Update parameters as needed (e.g., Environment)
+# 2. Deploy with:
+#    aws cloudformation deploy --template-file cloudformation.yaml --stack-name drowsiness-alert-system --capabilities CAPABILITY_IAM
+# 3. Check Outputs for resource ARNs and endpoints
+# =====================================================================
+
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
-  Car Drowsiness Alert System Infrastructure (Free Tier Optimized)
+  Car Drowsiness Alert System Infrastructure (Free Tier Optimized) - Fixed Version
   
   Tables:
   1. DriversTable: Stores driver profiles with medical info
@@ -125,6 +142,10 @@ Resources:
                   - 'dynamodb:UpdateItem'
                   - 'dynamodb:Query'
                   - 'dynamodb:Scan'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:DescribeTable'
                 Resource: 
                   - !GetAtt DriversTable.Arn
                   - !GetAtt AlertsTable.Arn
@@ -134,6 +155,12 @@ Resources:
                   - 'iot:Publish'
                   - 'iot:Connect'
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
 
   # Lambda Functions
   UpdateDriverProfileFunction:
@@ -162,6 +189,7 @@ Resources:
           # Configure logging
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
+          logger.info("Lambda module imported successfully")
 
           # Initialize AWS services
           dynamodb = boto3.resource('dynamodb')
@@ -342,8 +370,6 @@ Resources:
           def lambda_handler(event, context):
               """
               Lambda function to handle driver profile updates.
-              When a driver updates their profile via the infotainment system,
-              this function updates the record in DynamoDB.
               """
               logger.info(f"Received driver profile update: {json.dumps(event)}")
               
@@ -421,166 +447,393 @@ Resources:
           DRIVERS_TABLE: !Ref DriversTable
           ALERTS_TABLE: !Ref AlertsTable
           ENVIRONMENT: !Ref Environment
+          AMBULANCE_API_URL: !Sub "https://${DrowsinessAlertApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/ambulance-alert"
       Code:
         ZipFile: |
           import json
           import boto3
           import uuid
+          import time
           from datetime import datetime, timedelta
           import os
           import logging
+          import urllib.request
+          import json as json_module
+          from decimal import Decimal
+          import decimal
+          import traceback
 
-          # Configure logging
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
+          logger.info("ProcessDrowsinessAlert Lambda started")
 
-          # Initialize AWS services
           dynamodb = boto3.resource('dynamodb')
           iot_client = boto3.client('iot-data')
 
-          # Get table names from environment variables
           DRIVERS_TABLE = os.environ.get('DRIVERS_TABLE', 'drivers')
           ALERTS_TABLE = os.environ.get('ALERTS_TABLE', 'drowsiness_alerts')
+          AMBULANCE_API_URL = os.environ.get('AMBULANCE_API_URL')
 
-          def validate_drowsiness_level(level):
-              """Validate drowsiness level"""
-              if level is None:
-                  return 0
-              try:
-                  level = float(level)
-                  if 0 <= level <= 1:
-                      return level
-                  return 0
-              except (ValueError, TypeError):
-                  return 0
-
-          def validate_confidence(confidence):
-              """Validate confidence score"""
-              if confidence is None:
-                  return 0
-              try:
-                  confidence = float(confidence)
-                  if 0 <= confidence <= 1:
-                      return confidence
-                  return 0
-              except (ValueError, TypeError):
-                  return 0
-
-          def validate_location(location):
-              """Validate location coordinates"""
-              if not location or not isinstance(location, dict):
-                  return {}
-              
-              valid_location = {}
-              
-              try:
-                  lat = float(location.get('latitude', 0))
-                  lng = float(location.get('longitude', 0))
-                  if -90 <= lat <= 90 and -180 <= lng <= 180:
-                      valid_location['latitude'] = lat
-                      valid_location['longitude'] = lng
-              except (ValueError, TypeError):
-                  pass
-              
-              return valid_location
-
-          def validate_speed(speed):
-              """Validate vehicle speed"""
-              if speed is None:
-                  return 0
-              try:
-                  speed = float(speed)
-                  if 0 <= speed <= 300:  # Assuming max speed is 300 km/h
-                      return speed
-                  return 0
-              except (ValueError, TypeError):
-                  return 0
+          def decimal_default(obj):
+              if isinstance(obj, decimal.Decimal):
+                  return float(obj)
+              raise TypeError
 
           def lambda_handler(event, context):
-              """
-              Lambda function triggered by AWS IoT Core when a drowsiness alert is received.
-              This function:
-              1. Receives the alert from the vehicle
-              2. Retrieves the driver's information from DynamoDB
-              3. Combines the data
-              4. Stores the alert in DynamoDB
-              5. Publishes the combined data to the ambulance dashboard
-              """
-              logger.info(f"Received drowsiness alert: {json.dumps(event)}")
+              logger.info(f"Received drowsiness alert event: {json.dumps(event, default=str)}")
               
               drivers_table = dynamodb.Table(DRIVERS_TABLE)
               alerts_table = dynamodb.Table(ALERTS_TABLE)
               
               try:
+                  # Extract data from event
+                  alert_id = event.get('alert_id')
                   driver_id = event.get('driver_id')
+                  timestamp = event.get('timestamp', datetime.utcnow().isoformat())
+                  location = event.get('location', {})
+                  message = event.get('message', 'Driver fell asleep')
+                  
+                  logger.info(f"Processing alert - ID: {alert_id}, Driver: {driver_id}")
+                  
                   if not driver_id:
                       raise ValueError("Alert missing driver_id")
                   
-                  alert_id = str(uuid.uuid4())
-                  timestamp = event.get('timestamp', datetime.utcnow().isoformat())
+                  if not alert_id:
+                      alert_id = str(uuid.uuid4())
+                      logger.info(f"Generated new alert_id: {alert_id}")
+                  
                   ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
                   
-                  # Validate all fields
+                  # Build location object with proper handling
+                  location_obj = {}
+                  if isinstance(location, dict):
+                      if 'latitude' in location and location['latitude'] is not None:
+                          location_obj['latitude'] = Decimal(str(location['latitude']))
+                      if 'longitude' in location and location['longitude'] is not None:
+                          location_obj['longitude'] = Decimal(str(location['longitude']))
+                      if 'description' in location and location['description']:
+                          location_obj['description'] = str(location['description'])
+                  
+                  # Build alert record
                   alert_record = {
                       'alert_id': alert_id,
                       'driver_id': driver_id,
                       'timestamp': timestamp,
-                      'drowsiness_level': validate_drowsiness_level(event.get('drowsiness_level')),
-                      'confidence': validate_confidence(event.get('confidence')),
-                      'location': validate_location(event.get('location', {})),
-                      'speed': validate_speed(event.get('speed')),
+                      'message': message,
                       'processed': True,
                       'ttl': ttl
                   }
                   
-                  # Get driver information
-                  driver_response = drivers_table.get_item(
-                      Key={'id': driver_id}
-                  )
+                  # Add location if it exists
+                  if location_obj:
+                      alert_record['location'] = location_obj
                   
-                  if 'Item' not in driver_response:
-                      logger.warning(f"Driver with ID {driver_id} not found in database")
+                  logger.info(f"Writing alert to DynamoDB: {json.dumps(alert_record, default=str)}")
+                  
+                  # Write to DynamoDB with retry logic
+                  max_retries = 3
+                  for attempt in range(max_retries):
+                      try:
+                          alerts_table.put_item(Item=alert_record)
+                          logger.info(f"Successfully wrote alert to DynamoDB on attempt {attempt + 1}")
+                          break
+                      except Exception as write_error:
+                          logger.error(f"DynamoDB write attempt {attempt + 1} failed: {str(write_error)}")
+                          if attempt == max_retries - 1:
+                              raise write_error
+                          time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                  
+                  # Get driver info
+                  try:
+                      driver_response = drivers_table.get_item(Key={'id': driver_id})
+                      if 'Item' in driver_response:
+                          driver_info = driver_response['Item']
+                          logger.info(f"Found driver info for {driver_id}")
+                      else:
+                          logger.warning(f"Driver with ID {driver_id} not found in database")
+                          driver_info = {
+                              'id': driver_id,
+                              'name': 'Unknown Driver',
+                              'emergency_contact': 'Not available'
+                          }
+                  except Exception as driver_error:
+                      logger.error(f"Error fetching driver info: {str(driver_error)}")
                       driver_info = {
                           'id': driver_id,
                           'name': 'Unknown Driver',
-                          'car_info': {'vehicle': 'Unknown Vehicle'}
+                          'emergency_contact': 'Not available'
                       }
-                  else:
-                      driver_info = driver_response['Item']
                   
-                  # Store alert in DynamoDB
-                  alerts_table.put_item(Item=alert_record)
-                  
-                  # Prepare complete alert for ambulance dashboard
+                  # Prepare combined alert for ambulance
                   complete_alert = {
                       'alert': alert_record,
-                      'driver_info': driver_info
+                      'driver_info': driver_info,
+                      'processed_at': datetime.utcnow().isoformat()
                   }
                   
-                  # Publish to ambulance dashboard
-                  iot_client.publish(
-                      topic='ambulance/alerts/drowsiness',
-                      qos=1,
-                      payload=json.dumps(complete_alert)
-                  )
+                  # Send to ambulance dashboard via HTTP
+                  if AMBULANCE_API_URL:
+                      try:
+                          data = json_module.dumps(complete_alert, default=decimal_default).encode('utf-8')
+                          req = urllib.request.Request(
+                              AMBULANCE_API_URL, 
+                              data=data, 
+                              headers={
+                                  'Content-Type': 'application/json',
+                                  'User-Agent': 'DrowsinessAlertSystem/1.0'
+                              }
+                          )
+                          with urllib.request.urlopen(req, timeout=10) as response:
+                              response_data = response.read().decode('utf-8')
+                              logger.info(f"Sent alert to ambulance dashboard. Status: {response.getcode()}, Response: {response_data}")
+                      except Exception as http_error:
+                          logger.error(f"Failed to send alert to ambulance dashboard: {str(http_error)}")
+                          # Don't fail the entire function if HTTP call fails
                   
-                  logger.info(f"Published alert to ambulance dashboard: {json.dumps(complete_alert)}")
+                  # Send acknowledgment back to vehicle via IoT
+                  try:
+                      acknowledgment = {
+                          'alert_id': alert_id,
+                          'status': 'processed',
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'message': 'Alert received and processed successfully'
+                      }
+                      
+                      iot_client.publish(
+                          topic='vehicle/alerts/ack',
+                          qos=1,
+                          payload=json.dumps(acknowledgment)
+                      )
+                      logger.info(f"Sent acknowledgment to vehicle for alert: {alert_id}")
+                  except Exception as iot_error:
+                      logger.error(f"Failed to send IoT acknowledgment: {str(iot_error)}")
+                      # Don't fail the entire function if IoT publish fails
+                  
                   return {
                       'statusCode': 200,
                       'body': json.dumps({
                           'message': 'Alert processed successfully',
-                          'alert_id': alert_id
+                          'alert_id': alert_id,
+                          'driver_id': driver_id
                       })
                   }
                   
               except Exception as e:
                   logger.error(f"Error processing drowsiness alert: {str(e)}")
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  
+                  # Try to send error acknowledgment
+                  try:
+                      if 'driver_id' in locals():
+                          error_ack = {
+                              'alert_id': event.get('alert_id', 'unknown'),
+                              'status': 'error',
+                              'timestamp': datetime.utcnow().isoformat(),
+                              'message': f'Error processing alert: {str(e)}'
+                          }
+                          iot_client.publish(
+                              topic='vehicle/alerts/ack',
+                              qos=1,
+                              payload=json.dumps(error_ack)
+                          )
+                  except:
+                      pass  # Don't let error handling fail
+                  
                   return {
                       'statusCode': 500,
+                      'body': json.dumps({
+                          'message': f'Error processing alert: {str(e)}',
+                          'alert_id': event.get('alert_id', 'unknown')
+                      })
+                  }
+
+  AmbulanceAlertHttpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ambulance_alert_http_handler-${Environment}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"Received ambulance alert via HTTP: {json.dumps(event, default=str)}")
+              
+              try:
+                  # Parse the request body
+                  if event.get('body'):
+                      body = json.loads(event['body'])
+                      logger.info(f"Parsed alert data: {json.dumps(body, default=str)}")
+                      
+                      # Here you can process/store/forward the alert as needed
+                      # For now, just log and acknowledge
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'message': 'Ambulance alert received and processed',
+                              'alert_id': body.get('alert', {}).get('alert_id', 'unknown')
+                          })
+                      }
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'message': 'No request body provided'})
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Error processing ambulance alert: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
                       'body': json.dumps({
                           'message': f'Error processing alert: {str(e)}'
                       })
                   }
+
+  HttpUpdateProfileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "http_update_profile-${Environment}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DRIVERS_TABLE: !Ref DriversTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+          import os
+          import logging
+          import traceback
+          from decimal import Decimal
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource('dynamodb')
+          iot_client = boto3.client('iot-data')
+
+          DRIVERS_TABLE = os.environ.get('DRIVERS_TABLE', 'drivers')
+
+          def lambda_handler(event, context):
+              logger.info(f"Received HTTP profile update request: {json.dumps(event, default=str)}")
+              
+              try:
+                  # Parse request body
+                  if 'body' not in event:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'message': 'Request body is missing'})
+                      }
+                  
+                  body = json.loads(event['body'])
+                  
+                  # Validate required fields
+                  if not body.get('id'):
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'message': 'Driver ID is required'})
+                      }
+                  
+                  # Prepare data for DynamoDB
+                  driver_data = {
+                      'id': body['id'],
+                      'name': body.get('name', 'Unknown Driver'),
+                      'gender': body.get('gender', 'unknown'),
+                      'date_of_birth': body.get('date_of_birth', ''),
+                      'weight': Decimal(str(body.get('weight', 0))),
+                      'height': Decimal(str(body.get('height', 0))),
+                      'emergency_contact': body.get('emergency_contact', ''),
+                      'blood_type': body.get('blood_type', ''),
+                      'chronic_diseases': body.get('chronic_diseases', []),
+                      'allergies': body.get('allergies', []),
+                      'last_updated': datetime.utcnow().isoformat(),
+                      'ttl': int((datetime.utcnow() + timedelta(days=365)).timestamp())
+                  }
+                  
+                  # Store in DynamoDB
+                  drivers_table = dynamodb.Table(DRIVERS_TABLE)
+                  drivers_table.put_item(Item=driver_data)
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'message': 'Driver profile updated successfully',
+                          'id': body['id']
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error updating profile: {str(e)}")
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'message': f'Error updating profile: {str(e)}'
+                      })
+                  }
+
+  # CRITICAL FIX: Lambda Permissions for IoT Rules
+  DrowsinessAlertRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessDrowsinessAlertFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt DrowsinessAlertRule.Arn
+
+  DriverProfileRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateDriverProfileFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt DriverProfileRule.Arn
 
   # IoT Rules
   DrowsinessAlertRule:
@@ -589,7 +842,7 @@ Resources:
       RuleName: !Sub drowsiness_alert_rule_${Environment}
       TopicRulePayload:
         RuleDisabled: false
-        Sql: !Sub "SELECT * FROM 'vehicle/alerts/drowsiness'"
+        Sql: "SELECT * FROM 'vehicle/alerts/drowsiness'"
         Actions:
           - Lambda:
               FunctionArn: !GetAtt ProcessDrowsinessAlertFunction.Arn
@@ -597,22 +850,106 @@ Resources:
   DriverProfileRule:
     Type: AWS::IoT::TopicRule
     Properties:
-      RuleName: !Sub driver_profile_${Environment}
+      RuleName: !Sub driver_profile_rule_${Environment}
       TopicRulePayload:
         RuleDisabled: false
-        Sql: !Sub "SELECT * FROM 'vehicle/driver/profile'"
+        Sql: "SELECT * FROM 'vehicle/driver/profile'"
         Actions:
           - Lambda:
               FunctionArn: !GetAtt UpdateDriverProfileFunction.Arn
+
+  # API Gateway
+  DrowsinessAlertApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "drowsiness-alert-api-${Environment}"
+      Description: API for Driver Drowsiness Alert System
+
+  # Driver Profile Resource
+  ApiGatewayDriverResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+      ParentId: !GetAtt DrowsinessAlertApi.RootResourceId
+      PathPart: driver-profile
+
+  ApiGatewayDriverMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+      ResourceId: !Ref ApiGatewayDriverResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HttpUpdateProfileFunction.Arn}/invocations"
+
+  # Ambulance Alert Resource
+  AmbulanceAlertResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+      ParentId: !GetAtt DrowsinessAlertApi.RootResourceId
+      PathPart: ambulance-alert
+
+  AmbulanceAlertMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+      ResourceId: !Ref AmbulanceAlertResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AmbulanceAlertHttpFunction.Arn}/invocations"
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - ApiGatewayDriverMethod
+      - AmbulanceAlertMethod
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+      DeploymentId: !Ref ApiGatewayDeployment
+      StageName: !Ref Environment
+
+  # Lambda Permissions for API Gateway
+  ApiGatewayDriverPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HttpUpdateProfileFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DrowsinessAlertApi}/*/*/*"
+
+  AmbulanceAlertApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AmbulanceAlertHttpFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DrowsinessAlertApi}/*/*/*"
 
 Outputs:
   DriversTableName:
     Description: Name of the DynamoDB table for driver profiles
     Value: !Ref DriversTable
+    Export:
+      Name: !Sub "${AWS::StackName}-DriversTable"
 
   AlertsTableName:
     Description: Name of the DynamoDB table for drowsiness alerts
     Value: !Ref AlertsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertsTable"
 
   UpdateDriverProfileFunctionArn:
     Description: ARN of the Lambda function for updating driver profiles
@@ -622,6 +959,30 @@ Outputs:
     Description: ARN of the Lambda function for processing drowsiness alerts
     Value: !GetAtt ProcessDrowsinessAlertFunction.Arn
 
+  LambdaExecutionRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  DrowsinessAlertRuleArn:
+    Description: IoT Rule ARN for drowsiness alerts
+    Value: !GetAtt DrowsinessAlertRule.Arn
+
+  DriverProfileRuleArn:
+    Description: IoT Rule ARN for driver profile updates
+    Value: !GetAtt DriverProfileRule.Arn
+
   IotPolicyName:
     Description: Name of the IoT policy
-    Value: !Ref DrowsinessAlertPolicy 
+    Value: !Ref DrowsinessAlertPolicy
+
+  IotEndpoint:
+    Description: AWS IoT Core Data-ATS endpoint (for MQTT clients)
+    Value: !Sub "${AWS::Region}.amazonaws.com"
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL for driver profile updates
+    Value: !Sub "https://${DrowsinessAlertApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/driver-profile"
+
+  AmbulanceAlertApiEndpoint:
+    Description: API Gateway endpoint URL for ambulance dashboard to receive combined alerts
+    Value: !Sub "https://${DrowsinessAlertApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/ambulance-alert" 

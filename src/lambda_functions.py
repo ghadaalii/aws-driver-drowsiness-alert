@@ -9,6 +9,9 @@ import uuid
 from datetime import datetime, timedelta
 import os
 import logging
+import csv
+import io
+import decimal
 
 # Configure logging
 logger = logging.getLogger()
@@ -30,6 +33,167 @@ FREE_TIER_LIMITS = {
     'lambda_invocations': 1000000,
     'lambda_compute_seconds': 400000
 }
+
+def map_json_to_database(json_data):
+    """
+    Map JSON data to match database columns
+    
+    Args:
+        json_data (dict): The JSON data to map
+        
+    Returns:
+        dict: Mapped data ready for database insertion
+    """
+    try:
+        # Extract and map the data
+        mapped_data = {
+            'id': json_data.get('id'),
+            'name': json_data.get('name'),
+            'gender': json_data.get('gender'),
+            'date_of_birth': json_data.get('date_of_birth'),
+            'weight': float(json_data.get('weight', 0)),
+            'height': float(json_data.get('height', 0)),
+            'emergency_contact': json_data.get('emergency_contact'),
+            'blood_type': json_data.get('blood_type'),
+            'chronic_diseases': json_data.get('chronic_diseases', []),
+            'allergies': json_data.get('allergies', []),
+            'last_updated': datetime.utcnow().isoformat(),
+            'ttl': int((datetime.utcnow() + timedelta(days=365)).timestamp())
+        }
+        
+        # Validate required fields
+        required_fields = ['id', 'name', 'gender', 'date_of_birth', 'weight', 'height', 'emergency_contact', 'blood_type']
+        missing_fields = [field for field in required_fields if not mapped_data.get(field)]
+        
+        if missing_fields:
+            raise ValueError(f"Missing required fields: {', '.join(missing_fields)}")
+        
+        return mapped_data
+        
+    except Exception as e:
+        logger.error(f"Error mapping JSON data: {str(e)}")
+        raise
+
+def process_json_file(json_file_content):
+    """
+    Process JSON file content and store in database
+    
+    Args:
+        json_file_content (str): The content of the JSON file
+        
+    Returns:
+        dict: Processing results
+    """
+    try:
+        # Parse JSON content
+        data = json.loads(json_file_content)
+        
+        # Map data to database format
+        mapped_data = map_json_to_database(data)
+        
+        # Store in DynamoDB
+        drivers_table = dynamodb.Table(DRIVERS_TABLE)
+        drivers_table.put_item(Item=mapped_data)
+        
+        # Publish to IoT Core
+        iot_client.publish(
+            topic='vehicle/driver/profile',
+            qos=1,
+            payload=json.dumps(mapped_data)
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Data processed successfully',
+                'id': mapped_data['id']
+            })
+        }
+        
+    except json.JSONDecodeError:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({
+                'message': 'Invalid JSON format'
+            })
+        }
+    except ValueError as e:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({
+                'message': str(e)
+            })
+        }
+    except Exception as e:
+        logger.error(f"Error processing JSON file: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'message': f'Error processing file: {str(e)}'
+            })
+        }
+
+def http_update_profile_handler(event, context):
+    """
+    Lambda function to handle HTTP requests for driver profile updates.
+    This function:
+    1. Receives HTTP POST requests from the infotainment system
+    2. Validates the incoming data
+    3. Updates the driver profile in DynamoDB
+    4. Publishes to IoT Core for real-time updates
+    
+    Args:
+        event (dict): The event data from API Gateway
+        context (LambdaContext): The Lambda context object
+    
+    Returns:
+        dict: Response containing status code and message
+    """
+    logger.info(f"Received HTTP request: {json.dumps(event)}")
+    
+    try:
+        # Parse request body
+        if 'body' not in event:
+            return {
+                'statusCode': 400,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({
+                    'message': 'Request body is missing'
+                })
+            }
+        
+        try:
+            body = json.loads(event['body'])
+        except json.JSONDecodeError:
+            return {
+                'statusCode': 400,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({
+                    'message': 'Invalid JSON in request body'
+                })
+            }
+        
+        # Process the JSON data
+        return process_json_file(json.dumps(body))
+        
+    except Exception as e:
+        logger.error(f"Error processing HTTP request: {str(e)}")
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'message': f'Error updating profile: {str(e)}'
+            })
+        }
 
 def update_profile_handler(event, context):
     """
@@ -97,6 +261,7 @@ def process_alert_handler(event, context):
     3. Combines the data
     4. Stores the alert in DynamoDB
     5. Publishes the combined data to the ambulance dashboard
+    6. Sends acknowledgment back to the vehicle
     
     Args:
         event (dict): The event data from IoT Core
@@ -111,59 +276,90 @@ def process_alert_handler(event, context):
     alerts_table = dynamodb.Table(ALERTS_TABLE)
     
     try:
+        # Extract alert data from event
+        alert_id = event.get('alert_id', str(uuid.uuid4()))
         driver_id = event.get('driver_id')
+        timestamp = event.get('timestamp', datetime.utcnow().isoformat())
+        location = event.get('location', {})
+        message = event.get('message', 'Driver drowsiness detected')
+        
         if not driver_id:
             raise ValueError("Alert missing driver_id")
         
-        alert_id = str(uuid.uuid4())
-        timestamp = event.get('timestamp', datetime.utcnow().isoformat())
         ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
         
+        # Get driver information from database
         driver_response = drivers_table.get_item(
-            Key={'driver_id': driver_id}
+            Key={'id': driver_id}  # Note: using 'id' as primary key for drivers table
         )
         
         if 'Item' not in driver_response:
             logger.warning(f"Driver with ID {driver_id} not found in database")
             driver_info = {
-                'driver_id': driver_id,
+                'id': driver_id,
                 'name': 'Unknown Driver',
-                'car_info': {'vehicle': 'Unknown Vehicle'}
+                'emergency_contact': 'Unknown',
+                'blood_type': 'Unknown'
             }
         else:
             driver_info = driver_response['Item']
         
+        # Create alert record matching CloudFormation table structure
         alert_record = {
             'alert_id': alert_id,
             'driver_id': driver_id,
             'timestamp': timestamp,
-            'drowsiness_level': event.get('drowsiness_level', 'unknown'),
-            'confidence': event.get('confidence', 0),
-            'location': event.get('location', {}),
-            'speed': event.get('speed', 0),
+            'location': location,
+            'message': message,
             'processed': True,
             'ttl': ttl
         }
         
+        # Store alert in DynamoDB
         alerts_table.put_item(Item=alert_record)
+        logger.info(f"Alert stored in database: {alert_id}")
         
+        # Create complete alert for ambulance dashboard
         complete_alert = {
             'alert': alert_record,
             'driver_info': driver_info
         }
         
+        # Helper for Decimal serialization
+        def decimal_default(obj):
+            if isinstance(obj, decimal.Decimal):
+                return float(obj)
+            raise TypeError
+        
+        # Publish to ambulance dashboard
         iot_client.publish(
             topic='ambulance/alerts/drowsiness',
             qos=1,
-            payload=json.dumps(complete_alert)
+            payload=json.dumps(complete_alert, default=decimal_default)
         )
+        logger.info(f"Published alert to ambulance dashboard: {alert_id}")
         
-        logger.info(f"Published alert to ambulance dashboard: {json.dumps(complete_alert)}")
+        # Send acknowledgment back to vehicle
+        acknowledgment = {
+            'alert_id': alert_id,
+            'status': 'processed',
+            'timestamp': datetime.utcnow().isoformat(),
+            'message': 'Alert received and processed successfully'
+        }
+        
+        iot_client.publish(
+            topic='vehicle/alerts/ack',
+            qos=1,
+            payload=json.dumps(acknowledgment)
+        )
+        logger.info(f"Sent acknowledgment to vehicle: {alert_id}")
+        
         return {
             'statusCode': 200,
             'body': json.dumps({
                 'message': 'Alert processed successfully',
-                'alert_id': alert_id
+                'alert_id': alert_id,
+                'driver_found': 'Item' in driver_response
             })
         }
         

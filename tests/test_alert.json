@@ -1,0 +1,11 @@
+{
+    "alert_id": "3a59e913-23fc-adbc-f76d-9055e051aba1",
+    "driver_id": "c0027ba3-3a9f-adb7-025f-83924e0db31e",
+    "location": {
+        "description": "Cairo, Egypt",
+        "latitude": 30.0444,
+        "longitude": 31.2357
+    },
+    "message": "Driver fell asleep",
+    "timestamp": "2025-06-22T18:01:21Z"
+}
