@@ -1,27 +1,34 @@
 # =====================================================================
-# Driver Drowsiness Alert System CloudFormation Template - FIXED VERSION
+# Driver Drowsiness Alert System CloudFormation Template - WEBSOCKET VERSION
 #
-# Key Fixes:
-# - Added missing Lambda permissions for IoT Rules
-# - Fixed IoT endpoint configuration
-# - Improved error handling in Lambda functions
-# - Added proper logging and debugging
-# - Fixed DynamoDB table structure issues
+# Key Features:
+# - Real-time WebSocket communication for ambulance dashboard
+# - Connection management for multiple dashboard instances
+# - Instant alert delivery without polling
+# - Professional and organized structure
+# - Free Tier optimized
 #
 # Deployment Instructions:
 # 1. Update parameters as needed (e.g., Environment)
 # 2. Deploy with:
 #    aws cloudformation deploy --template-file cloudformation.yaml --stack-name drowsiness-alert-system --capabilities CAPABILITY_IAM
-# 3. Check Outputs for resource ARNs and endpoints
+# 3. Check Outputs for WebSocket endpoint and other resource ARNs
 # =====================================================================
 
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
-  Car Drowsiness Alert System Infrastructure (Free Tier Optimized) - Fixed Version
+  Car Drowsiness Alert System Infrastructure with WebSocket Support (Free Tier Optimized)
   
   Tables:
   1. DriversTable: Stores driver profiles with medical info
   2. AlertsTable: Stores drowsiness alerts with driver info
+  3. WebSocketConnectionsTable: Manages active WebSocket connections for real-time alerts
+  
+  WebSocket Features:
+  - Real-time alert delivery to ambulance dashboard
+  - Connection management and cleanup
+  - Instant notification without polling
+  - Support for multiple dashboard instances
 
 Parameters:
   Environment:
@@ -31,7 +38,9 @@ Parameters:
     Description: Deployment environment
 
 Resources:
+  # =====================================================================
   # IoT Core Policy (Free Tier: 250,000 messages/month)
+  # =====================================================================
   DrowsinessAlertPolicy:
     Type: AWS::IoT::Policy
     Properties:
@@ -47,7 +56,9 @@ Resources:
               - 'iot:Receive'
             Resource: '*'
 
+  # =====================================================================
   # DynamoDB Tables (Free Tier: 25 WCU and 25 RCU)
+  # =====================================================================
   DriversTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -117,7 +128,45 @@ Resources:
         - Key: DataClassification
           Value: "Sensitive"
 
+  # WebSocket Connections Table for Real-time Dashboard Management
+  WebSocketConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "websocket-connections-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connection_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connection_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: FreeTier
+          Value: "true"
+        - Key: Purpose
+          Value: "WebSocket Connections"
+        - Key: DataClassification
+          Value: "Internal"
+
+  # =====================================================================
   # IAM Role for Lambda Functions
+  # =====================================================================
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -149,7 +198,9 @@ Resources:
                 Resource: 
                   - !GetAtt DriversTable.Arn
                   - !GetAtt AlertsTable.Arn
+                  - !GetAtt WebSocketConnectionsTable.Arn
                   - !Sub "${AlertsTable.Arn}/index/*"
+                  - !Sub "${WebSocketConnectionsTable.Arn}/index/*"
               - Effect: Allow
                 Action:
                   - 'iot:Publish'
@@ -157,12 +208,18 @@ Resources:
                 Resource: '*'
               - Effect: Allow
                 Action:
+                  - 'execute-api:ManageConnections'
+                Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+              - Effect: Allow
+                Action:
                   - 'logs:CreateLogGroup'
                   - 'logs:CreateLogStream'
                   - 'logs:PutLogEvents'
                 Resource: 'arn:aws:logs:*:*:*'
 
+  # =====================================================================
   # Lambda Functions
+  # =====================================================================
   UpdateDriverProfileFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -446,8 +503,9 @@ Resources:
         Variables:
           DRIVERS_TABLE: !Ref DriversTable
           ALERTS_TABLE: !Ref AlertsTable
+          WEBSOCKET_CONNECTIONS_TABLE: !Ref WebSocketConnectionsTable
           ENVIRONMENT: !Ref Environment
-          AMBULANCE_API_URL: !Sub "https://${DrowsinessAlertApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/ambulance-alert"
+          WEBSOCKET_API_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
       Code:
         ZipFile: |
           import json
@@ -457,27 +515,65 @@ Resources:
           from datetime import datetime, timedelta
           import os
           import logging
-          import urllib.request
-          import json as json_module
+          import traceback
           from decimal import Decimal
           import decimal
-          import traceback
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
           logger.info("ProcessDrowsinessAlert Lambda started")
 
           dynamodb = boto3.resource('dynamodb')
-          iot_client = boto3.client('iot-data')
 
           DRIVERS_TABLE = os.environ.get('DRIVERS_TABLE', 'drivers')
           ALERTS_TABLE = os.environ.get('ALERTS_TABLE', 'drowsiness_alerts')
-          AMBULANCE_API_URL = os.environ.get('AMBULANCE_API_URL')
+          WEBSOCKET_CONNECTIONS_TABLE = os.environ.get('WEBSOCKET_CONNECTIONS_TABLE', 'websocket-connections')
+          WEBSOCKET_API_ENDPOINT = os.environ.get('WEBSOCKET_API_ENDPOINT')
 
           def decimal_default(obj):
               if isinstance(obj, decimal.Decimal):
                   return float(obj)
               raise TypeError
+
+          def send_to_websocket_connections(alert_data):
+              """Send alert to all connected WebSocket clients"""
+              try:
+                  # Get all active connections
+                  connections_table = dynamodb.Table(WEBSOCKET_CONNECTIONS_TABLE)
+                  response = connections_table.scan()
+                  
+                  if not response.get('Items'):
+                      logger.info("No active WebSocket connections found")
+                      return
+                  
+                  # Initialize API Gateway Management API client
+                  apigw_client = boto3.client(
+                      'apigatewaymanagementapi',
+                      endpoint_url=WEBSOCKET_API_ENDPOINT
+                  )
+                  
+                  # Send alert to each connected client
+                  for connection in response['Items']:
+                      connection_id = connection['connection_id']
+                      try:
+                          apigw_client.post_to_connection(
+                              ConnectionId=connection_id,
+                              Data=json.dumps(alert_data, default=decimal_default)
+                          )
+                          logger.info(f"Sent alert to connection: {connection_id}")
+                      except Exception as e:
+                          logger.warning(f"Failed to send to connection {connection_id}: {str(e)}")
+                          # Remove stale connection
+                          try:
+                              connections_table.delete_item(Key={'connection_id': connection_id})
+                              logger.info(f"Removed stale connection: {connection_id}")
+                          except:
+                              pass
+                  
+                  logger.info(f"Alert sent to {len(response['Items'])} WebSocket connections")
+                  
+              except Exception as e:
+                  logger.error(f"Error sending to WebSocket connections: {str(e)}")
 
           def lambda_handler(event, context):
               logger.info(f"Received drowsiness alert event: {json.dumps(event, default=str)}")
@@ -564,31 +660,16 @@ Resources:
                           'emergency_contact': 'Not available'
                       }
                   
-                  # Prepare combined alert for ambulance
+                  # Prepare combined alert for ambulance dashboard
                   complete_alert = {
+                      'type': 'drowsiness_alert',
                       'alert': alert_record,
                       'driver_info': driver_info,
                       'processed_at': datetime.utcnow().isoformat()
                   }
                   
-                  # Send to ambulance dashboard via HTTP
-                  if AMBULANCE_API_URL:
-                      try:
-                          data = json_module.dumps(complete_alert, default=decimal_default).encode('utf-8')
-                          req = urllib.request.Request(
-                              AMBULANCE_API_URL, 
-                              data=data, 
-                              headers={
-                                  'Content-Type': 'application/json',
-                                  'User-Agent': 'DrowsinessAlertSystem/1.0'
-                              }
-                          )
-                          with urllib.request.urlopen(req, timeout=10) as response:
-                              response_data = response.read().decode('utf-8')
-                              logger.info(f"Sent alert to ambulance dashboard. Status: {response.getcode()}, Response: {response_data}")
-                      except Exception as http_error:
-                          logger.error(f"Failed to send alert to ambulance dashboard: {str(http_error)}")
-                          # Don't fail the entire function if HTTP call fails
+                  # Send to ambulance dashboard via WebSocket (REAL-TIME)
+                  send_to_websocket_connections(complete_alert)
                   
                   # Send acknowledgment back to vehicle via IoT
                   try:
@@ -599,6 +680,7 @@ Resources:
                           'message': 'Alert received and processed successfully'
                       }
                       
+                      iot_client = boto3.client('iot-data')
                       iot_client.publish(
                           topic='vehicle/alerts/ack',
                           qos=1,
@@ -607,7 +689,6 @@ Resources:
                       logger.info(f"Sent acknowledgment to vehicle for alert: {alert_id}")
                   except Exception as iot_error:
                       logger.error(f"Failed to send IoT acknowledgment: {str(iot_error)}")
-                      # Don't fail the entire function if IoT publish fails
                   
                   return {
                       'statusCode': 200,
@@ -622,23 +703,6 @@ Resources:
                   logger.error(f"Error processing drowsiness alert: {str(e)}")
                   logger.error(f"Traceback: {traceback.format_exc()}")
                   
-                  # Try to send error acknowledgment
-                  try:
-                      if 'driver_id' in locals():
-                          error_ack = {
-                              'alert_id': event.get('alert_id', 'unknown'),
-                              'status': 'error',
-                              'timestamp': datetime.utcnow().isoformat(),
-                              'message': f'Error processing alert: {str(e)}'
-                          }
-                          iot_client.publish(
-                              topic='vehicle/alerts/ack',
-                              qos=1,
-                              payload=json.dumps(error_ack)
-                          )
-                  except:
-                      pass  # Don't let error handling fail
-                  
                   return {
                       'statusCode': 500,
                       'body': json.dumps({
@@ -647,10 +711,194 @@ Resources:
                       })
                   }
 
-  AmbulanceAlertHttpFunction:
+  # =====================================================================
+  # WebSocket API Gateway and Lambda Functions
+  # =====================================================================
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "drowsiness-alert-websocket-${Environment}"
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  WebSocketConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Sub "integrations/${WebSocketConnectIntegration}"
+
+  WebSocketDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Sub "integrations/${WebSocketDisconnectIntegration}"
+
+  WebSocketDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      AuthorizationType: NONE
+      OperationName: DefaultRoute
+      Target: !Sub "integrations/${WebSocketDefaultIntegration}"
+
+  WebSocketConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketConnectFunction.Arn}/invocations"
+
+  WebSocketDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketDisconnectFunction.Arn}/invocations"
+
+  WebSocketDefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketDefaultFunction.Arn}/invocations"
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: !Ref Environment
+      AutoDeploy: true
+
+  # WebSocket Lambda Functions
+  WebSocketConnectFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "ambulance_alert_http_handler-${Environment}"
+      FunctionName: !Sub "websocket-connect-${Environment}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          WEBSOCKET_CONNECTIONS_TABLE: !Ref WebSocketConnectionsTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource('dynamodb')
+          WEBSOCKET_CONNECTIONS_TABLE = os.environ.get('WEBSOCKET_CONNECTIONS_TABLE')
+
+          def lambda_handler(event, context):
+              logger.info(f"WebSocket connect event: {json.dumps(event)}")
+              
+              try:
+                  connection_id = event['requestContext']['connectionId']
+                  user_id = event.get('queryStringParameters', {}).get('userId', 'anonymous')
+                  
+                  # Store connection in DynamoDB
+                  connections_table = dynamodb.Table(WEBSOCKET_CONNECTIONS_TABLE)
+                  ttl = int((datetime.utcnow() + timedelta(hours=24)).timestamp())
+                  
+                  connections_table.put_item(Item={
+                      'connection_id': connection_id,
+                      'user_id': user_id,
+                      'connected_at': datetime.utcnow().isoformat(),
+                      'ttl': ttl
+                  })
+                  
+                  logger.info(f"Stored WebSocket connection: {connection_id} for user: {user_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Connected successfully',
+                          'connection_id': connection_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in WebSocket connect: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': f'Connection failed: {str(e)}'
+                      })
+                  }
+
+  WebSocketDisconnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "websocket-disconnect-${Environment}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          WEBSOCKET_CONNECTIONS_TABLE: !Ref WebSocketConnectionsTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource('dynamodb')
+          WEBSOCKET_CONNECTIONS_TABLE = os.environ.get('WEBSOCKET_CONNECTIONS_TABLE')
+
+          def lambda_handler(event, context):
+              logger.info(f"WebSocket disconnect event: {json.dumps(event)}")
+              
+              try:
+                  connection_id = event['requestContext']['connectionId']
+                  
+                  # Remove connection from DynamoDB
+                  connections_table = dynamodb.Table(WEBSOCKET_CONNECTIONS_TABLE)
+                  connections_table.delete_item(Key={'connection_id': connection_id})
+                  
+                  logger.info(f"Removed WebSocket connection: {connection_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Disconnected successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in WebSocket disconnect: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': f'Disconnect failed: {str(e)}'
+                      })
+                  }
+
+  WebSocketDefaultFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "websocket-default-${Environment}"
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Runtime: python3.9
@@ -668,50 +916,68 @@ Resources:
           logger.setLevel(logging.INFO)
 
           def lambda_handler(event, context):
-              logger.info(f"Received ambulance alert via HTTP: {json.dumps(event, default=str)}")
+              logger.info(f"WebSocket default event: {json.dumps(event)}")
               
               try:
-                  # Parse the request body
-                  if event.get('body'):
-                      body = json.loads(event['body'])
-                      logger.info(f"Parsed alert data: {json.dumps(body, default=str)}")
-                      
-                      # Here you can process/store/forward the alert as needed
-                      # For now, just log and acknowledge
-                      
-                      return {
-                          'statusCode': 200,
-                          'headers': {
-                              'Content-Type': 'application/json',
-                              'Access-Control-Allow-Origin': '*'
-                          },
-                          'body': json.dumps({
-                              'message': 'Ambulance alert received and processed',
-                              'alert_id': body.get('alert', {}).get('alert_id', 'unknown')
-                          })
-                      }
-                  else:
-                      return {
-                          'statusCode': 400,
-                          'headers': {
-                              'Content-Type': 'application/json',
-                              'Access-Control-Allow-Origin': '*'
-                          },
-                          'body': json.dumps({'message': 'No request body provided'})
-                      }
-                      
-              except Exception as e:
-                  logger.error(f"Error processing ambulance alert: {str(e)}")
+                  # Handle any other WebSocket messages
                   return {
-                      'statusCode': 500,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*'
-                      },
+                      'statusCode': 200,
                       'body': json.dumps({
-                          'message': f'Error processing alert: {str(e)}'
+                          'message': 'Message received',
+                          'action': 'default'
                       })
                   }
+                  
+              except Exception as e:
+                  logger.error(f"Error in WebSocket default: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': f'Error: {str(e)}'
+                      })
+                  }
+
+  # =====================================================================
+  # REST API Gateway (for backward compatibility)
+  # =====================================================================
+  DrowsinessAlertApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "drowsiness-alert-api-${Environment}"
+      Description: API for Driver Drowsiness Alert System
+
+  ApiGatewayDriverResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+      ParentId: !GetAtt DrowsinessAlertApi.RootResourceId
+      PathPart: driver-profile
+
+  ApiGatewayDriverMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+      ResourceId: !Ref ApiGatewayDriverResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HttpUpdateProfileFunction.Arn}/invocations"
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - ApiGatewayDriverMethod
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref DrowsinessAlertApi
+      DeploymentId: !Ref ApiGatewayDeployment
+      StageName: !Ref Environment
 
   HttpUpdateProfileFunction:
     Type: AWS::Lambda::Function
@@ -818,7 +1084,9 @@ Resources:
                       })
                   }
 
-  # CRITICAL FIX: Lambda Permissions for IoT Rules
+  # =====================================================================
+  # Lambda Permissions
+  # =====================================================================
   DrowsinessAlertRuleLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -835,7 +1103,41 @@ Resources:
       Principal: iot.amazonaws.com
       SourceArn: !GetAtt DriverProfileRule.Arn
 
+  WebSocketConnectLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketConnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*"
+
+  WebSocketDisconnectLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketDisconnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*"
+
+  WebSocketDefaultLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketDefaultFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*"
+
+  ApiGatewayDriverPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HttpUpdateProfileFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DrowsinessAlertApi}/*/*/*"
+
+  # =====================================================================
   # IoT Rules
+  # =====================================================================
   DrowsinessAlertRule:
     Type: AWS::IoT::TopicRule
     Properties:
@@ -858,86 +1160,9 @@ Resources:
           - Lambda:
               FunctionArn: !GetAtt UpdateDriverProfileFunction.Arn
 
-  # API Gateway
-  DrowsinessAlertApi:
-    Type: AWS::ApiGateway::RestApi
-    Properties:
-      Name: !Sub "drowsiness-alert-api-${Environment}"
-      Description: API for Driver Drowsiness Alert System
-
-  # Driver Profile Resource
-  ApiGatewayDriverResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref DrowsinessAlertApi
-      ParentId: !GetAtt DrowsinessAlertApi.RootResourceId
-      PathPart: driver-profile
-
-  ApiGatewayDriverMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref DrowsinessAlertApi
-      ResourceId: !Ref ApiGatewayDriverResource
-      HttpMethod: POST
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HttpUpdateProfileFunction.Arn}/invocations"
-
-  # Ambulance Alert Resource
-  AmbulanceAlertResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref DrowsinessAlertApi
-      ParentId: !GetAtt DrowsinessAlertApi.RootResourceId
-      PathPart: ambulance-alert
-
-  AmbulanceAlertMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref DrowsinessAlertApi
-      ResourceId: !Ref AmbulanceAlertResource
-      HttpMethod: POST
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AmbulanceAlertHttpFunction.Arn}/invocations"
-
-  # API Gateway Deployment
-  ApiGatewayDeployment:
-    Type: AWS::ApiGateway::Deployment
-    DependsOn: 
-      - ApiGatewayDriverMethod
-      - AmbulanceAlertMethod
-    Properties:
-      RestApiId: !Ref DrowsinessAlertApi
-
-  ApiGatewayStage:
-    Type: AWS::ApiGateway::Stage
-    Properties:
-      RestApiId: !Ref DrowsinessAlertApi
-      DeploymentId: !Ref ApiGatewayDeployment
-      StageName: !Ref Environment
-
-  # Lambda Permissions for API Gateway
-  ApiGatewayDriverPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref HttpUpdateProfileFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DrowsinessAlertApi}/*/*/*"
-
-  AmbulanceAlertApiGatewayPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref AmbulanceAlertHttpFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DrowsinessAlertApi}/*/*/*"
-
+# =====================================================================
+# Outputs
+# =====================================================================
 Outputs:
   DriversTableName:
     Description: Name of the DynamoDB table for driver profiles
@@ -950,6 +1175,12 @@ Outputs:
     Value: !Ref AlertsTable
     Export:
       Name: !Sub "${AWS::StackName}-AlertsTable"
+
+  WebSocketConnectionsTableName:
+    Description: Name of the DynamoDB table for WebSocket connections
+    Value: !Ref WebSocketConnectionsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-WebSocketConnectionsTable"
 
   UpdateDriverProfileFunctionArn:
     Description: ARN of the Lambda function for updating driver profiles
@@ -983,6 +1214,14 @@ Outputs:
     Description: API Gateway endpoint URL for driver profile updates
     Value: !Sub "https://${DrowsinessAlertApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/driver-profile"
 
-  AmbulanceAlertApiEndpoint:
-    Description: API Gateway endpoint URL for ambulance dashboard to receive combined alerts
-    Value: !Sub "https://${DrowsinessAlertApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/ambulance-alert" 
+  WebSocketApiEndpoint:
+    Description: WebSocket API Gateway endpoint URL for real-time ambulance dashboard
+    Value: !Sub "wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+
+  WebSocketApiId:
+    Description: WebSocket API Gateway ID
+    Value: !Ref WebSocketApi
+
+  WebSocketApiEndpointUrl:
+    Description: WebSocket API Gateway endpoint URL (HTTP)
+    Value: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}" 

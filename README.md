@@ -1,25 +1,27 @@
 # Driver Drowsiness Alert System
 
-A real-time system for detecting driver drowsiness and alerting emergency services using AWS IoT Core. The system is optimized for AWS Free Tier usage and includes comprehensive monitoring and cost optimization features.
+A real-time system for detecting driver drowsiness and alerting emergency services using AWS IoT Core with WebSocket support for real-time dashboard communication. The system is optimized for AWS Free Tier usage and includes comprehensive monitoring and cost optimization features.
 
 ## Project Overview
 
-This system monitors driver drowsiness in real-time and automatically alerts emergency services when necessary. It uses a Raspberry Pi for data collection and AWS services for processing and storage.
+This system monitors driver drowsiness in real-time and automatically alerts emergency services when necessary. It uses a Raspberry Pi for data collection, AWS services for processing and storage, and WebSocket connections for real-time ambulance dashboard communication.
 
-# System Status (June 2025)
+# System Status (January 2025)
 - **End-to-end flow is fully operational:**
-  - MQTT → IoT Core → Lambda → DynamoDB → MQTT Ack
+  - MQTT → IoT Core → Lambda → DynamoDB → WebSocket → Ambulance Dashboard
   - All Lambda code is managed inline in CloudFormation (see `cloudformation.yaml`).
-  - CloudFormation template includes robust error handling, logging, and correct resource naming (e.g., `driver-profile` for API Gateway).
-  - Alerts are stored in DynamoDB, acknowledgments are sent to the vehicle, and driver data is joined and sent to the ambulance dashboard.
+  - CloudFormation template includes robust error handling, logging, and correct resource naming.
+  - Alerts are stored in DynamoDB, acknowledgments are sent to the vehicle, and driver data is joined and sent to the ambulance dashboard via WebSocket connections.
+  - **WebSocket API Gateway provides real-time communication for ambulance dashboard**
 
 ### Key Features
 
 - Real-time drowsiness detection and alerting
 - Driver profile management with medical information
-- Emergency service integration with ambulance dashboard
+- Emergency service integration with real-time WebSocket dashboard
 - AWS IoT Core integration with MQTT communication
 - DynamoDB for data storage with automatic TTL
+- WebSocket API Gateway for real-time ambulance dashboard communication
 - Free Tier optimization with usage monitoring
 - Comprehensive testing suite
 - Lambda function processing with driver-alert data joining
@@ -39,7 +41,8 @@ This system monitors driver drowsiness in real-time and automatically alerts eme
    - Lambda: Serverless functions for data processing
    - DynamoDB: NoSQL database for data storage
    - CloudWatch: Monitoring and logging
-   - API Gateway: HTTP endpoints for profile updates and ambulance dashboard alerts
+   - API Gateway: WebSocket endpoints for real-time ambulance dashboard communication
+   - WebSocket API Gateway: Real-time bidirectional communication
 
 3. **Database Structure**
    - `drivers-dev` Table:
@@ -58,6 +61,14 @@ This system monitors driver drowsiness in real-time and automatically alerts eme
        - processed (Boolean) - Whether the alert has been processed
        - ttl (Number) - Time to live for automatic deletion
 
+   - `websocket-connections-dev` Table:
+     - Primary Key: `connection_id` (String)
+     - Columns:
+       - connection_id (String, Primary Key) - WebSocket connection identifier
+       - user_id (String) - User identifier for the connection
+       - timestamp (String, ISO8601) - When the connection was established
+       - ttl (Number) - Time to live for automatic deletion
+
 ## Data Flow
 
 1. **Driver Profile Flow**
@@ -71,7 +82,7 @@ This system monitors driver drowsiness in real-time and automatically alerts eme
 
 2. **Drowsiness Alert Flow**
    ```
-   Raspberry Pi → MQTT → IoT Core → Lambda → DynamoDB → Emergency Services
+   Raspberry Pi → MQTT → IoT Core → Lambda → DynamoDB → WebSocket → Ambulance Dashboard
                                                       ↓
                                                  Acknowledgment → Vehicle
    ```
@@ -82,14 +93,14 @@ This system monitors driver drowsiness in real-time and automatically alerts eme
      - Retrieves driver information from driver table
      - Processes alert data
      - Stores simplified alert in DynamoDB
-     - Publishes combined data to ambulance dashboard **via HTTP POST to API Gateway**
+     - **Sends combined data to ambulance dashboard via WebSocket connections**
      - Sends acknowledgment back to vehicle via `vehicle/alerts/ack`
 
 3. **Emergency Response Flow**
    ```
-   DynamoDB → Lambda → IoT Core → Emergency Dashboard
+   DynamoDB → Lambda → WebSocket API Gateway → Ambulance Dashboard (Real-time)
    ```
-   - Emergency services receive alert via HTTP POST endpoint
+   - Emergency services receive real-time alerts via WebSocket connections
    - Access complete driver information
    - View real-time location and medical data
    - Coordinate response with driver details
@@ -100,29 +111,33 @@ This system monitors driver drowsiness in real-time and automatically alerts eme
 FProject/
 ├── README.md
 ├── requirements.txt
-├── cloudformation.yaml
-├── main.py
-├── subscribe_and_publish.py
-├── test_lambda_alert_processing.py
+├── cloudformation.yaml          # AWS infrastructure with WebSocket support
+├── main.py                      # Main application entry point
+├── presentation_story.md        # Project presentation
 ├── src/
 │   ├── __init__.py
-│   ├── config.py              # Configuration and environment variables
-│   ├── lambda_functions.py    # AWS Lambda functions
+│   ├── config.py                # Configuration and environment variables
+│   ├── lambda_functions.py      # AWS Lambda functions with WebSocket support
 │   └── client/
 │       ├── __init__.py
-│       └── mqtt_client.py     # MQTT client for IoT Core
+│       └── mqtt_client.py       # MQTT client for IoT Core
 ├── tests/
-│   ├── test_driver_profile.py    # Driver profile flow tests
-│   ├── test_mqtt_messages.py     # MQTT message tests
-│   ├── test_data_flow.py         # Data flow tests
-│   └── test_database.py          # DynamoDB tests
-├── certificates/              # AWS IoT Core certificates
+│   ├── test_dashboard_data.py       # WebSocket dashboard data testing
+│   ├── test_combined_data.py        # Combined alert and driver data tests
+│   ├── test_end_to_end.py           # End-to-end system tests
+│   ├── test_alert.json              # Sample alert data
+│   ├── subscribe_and_publish.py     # MQTT communication testing
+│   ├── test_driver_profile.py       # Driver profile flow tests
+│   ├── test_mqtt_messages.py        # MQTT message tests
+│   ├── test_data_flow.py            # Data flow tests
+│   └── test_database.py             # DynamoDB tests
+├── certificates/                # AWS IoT Core certificates
 │   ├── device.pem.crt
 │   ├── private.pem.key
 │   ├── public.pem.key
 │   └── AmazonRootCA1.pem
 └── scripts/
-    └── create_certificates.sh  # Certificate creation script
+    └── create_certificates.sh   # Certificate creation script
 ```
 
 ## Components
@@ -130,19 +145,18 @@ FProject/
 1. **Core Application**
    - `main.py`: Main application entry point with usage monitoring
    - `src/config.py`: Configuration management and Free Tier limits
-   - `src/lambda_functions.py`: AWS Lambda functions for data processing
+   - `src/lambda_functions.py`: AWS Lambda functions for data processing with WebSocket support
    - `src/client/mqtt_client.py`: MQTT client for IoT Core communication
 
 2. **Testing**
-   - `test_lambda_alert_processing.py`: Comprehensive Lambda function testing
+   - `test_dashboard_data.py`: WebSocket dashboard communication testing
+   - `test_combined_data.py`: Combined alert and driver data testing
+   - `test_end_to_end.py`: Complete system flow testing
    - `subscribe_and_publish.py`: MQTT communication testing
-   - Test suite for driver profiles
-   - Test suite for MQTT messages
-   - Test suite for data flow
-   - Test suite for database operations
+   - Comprehensive test suite for all components
 
 3. **Infrastructure**
-   - `cloudformation.yaml`: AWS infrastructure definition
+   - `cloudformation.yaml`: AWS infrastructure definition with WebSocket API Gateway
    - `certificates/`: AWS IoT Core certificates
    - `scripts/`: Utility scripts
 
@@ -204,14 +218,21 @@ aws cloudformation deploy \
 
 ```bash
 # Test basic MQTT publish and subscribe
-python subscribe_and_publish.py
+python tests/subscribe_and_publish.py
 ```
 
-### Testing Lambda Function Processing
+### Testing WebSocket Dashboard Communication
 
 ```bash
-# Test complete Lambda function flow
-python test_lambda_alert_processing.py
+# Test WebSocket dashboard data flow
+python tests/test_dashboard_data.py
+```
+
+### Testing End-to-End Flow
+
+```bash
+# Test complete system flow
+python tests/test_end_to_end.py
 ```
 
 ### Sending Driver Profile
@@ -277,58 +298,91 @@ client.client.publish(
 )
 ```
 
-### Monitoring Ambulance Dashboard
+### Connecting to Ambulance Dashboard WebSocket
 
-The ambulance dashboard now receives combined alert and driver data via an HTTP POST endpoint:
+The ambulance dashboard receives real-time alerts via WebSocket connections:
 
-**Endpoint URL:**
-
+**WebSocket Endpoint URL:**
 ```
-https://<api-id>.execute-api.<region>.amazonaws.com/<env>/ambulance-alert
+wss://<api-id>.execute-api.<region>.amazonaws.com/<env>
 ```
 
-**Example POST request (Python):**
+**Example WebSocket Client (JavaScript):**
+```javascript
+const ws = new WebSocket('wss://<api-id>.execute-api.<region>.amazonaws.com/<env>');
 
+ws.onopen = function() {
+    console.log('Connected to ambulance dashboard WebSocket');
+};
+
+ws.onmessage = function(event) {
+    const alertData = JSON.parse(event.data);
+    console.log('Received alert:', alertData);
+    
+    // Process the combined alert and driver data
+    const { alert, driver_info } = alertData;
+    
+    // Update dashboard UI with real-time data
+    updateDashboard(alert, driver_info);
+};
+
+ws.onclose = function() {
+    console.log('Disconnected from WebSocket');
+};
+
+function updateDashboard(alert, driverInfo) {
+    // Update dashboard with real-time alert and driver information
+    document.getElementById('alert-id').textContent = alert.alert_id;
+    document.getElementById('driver-name').textContent = driverInfo.name;
+    document.getElementById('location').textContent = alert.location.description;
+    document.getElementById('blood-type').textContent = driverInfo.blood_type;
+    // ... update other dashboard elements
+}
+```
+
+**Example WebSocket Client (Python):**
 ```python
-import requests
+import websocket
 import json
 
-combined_alert = {
-    "alert": {
-        "alert_id": "ALERT123456",
-        "driver_id": "DRIVER001",
-        "timestamp": "2025-05-05T08:45:23Z",
-        "location": {
-            "latitude": 37.7749,
-            "longitude": -122.4194,
-            "description": "Test location"
-        },
-        "message": "Driver fell asleep",
-        "processed": True,
-        "ttl": 1781826822
-    },
-    "driver_info": {
-        "id": "DRIVER001",
-        "name": "John Doe",
-        "gender": "male",
-        "date_of_birth": "1990-01-01",
-        "weight": 75.5,
-        "height": 180.0,
-        "emergency_contact": "+1234567890",
-        "blood_type": "A+",
-        "chronic_diseases": ["Hypertension"],
-        "allergies": ["Penicillin"],
-        "last_updated": "2025-05-05T08:00:00Z",
-        "ttl": 1781826822
-    }
-}
+def on_message(ws, message):
+    alert_data = json.loads(message)
+    print(f"Received alert: {alert_data}")
+    
+    // Process the combined alert and driver data
+    alert = alert_data['alert']
+    driver_info = alert_data['driver_info']
+    
+    // Update dashboard with real-time data
+    update_dashboard(alert, driver_info)
 
-endpoint = "https://<api-id>.execute-api.<region>.amazonaws.com/<env>/ambulance-alert"
-response = requests.post(endpoint, json=combined_alert)
-print(response.status_code, response.text)
+def on_error(ws, error):
+    print(f"WebSocket error: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket connection closed")
+
+def on_open(ws):
+    print("Connected to ambulance dashboard WebSocket")
+
+def update_dashboard(alert, driver_info):
+    print(f"Alert ID: {alert['alert_id']}")
+    print(f"Driver: {driver_info['name']}")
+    print(f"Location: {alert['location']['description']}")
+    print(f"Blood Type: {driver_info['blood_type']}")
+
+// Connect to WebSocket
+websocket_url = "wss://<api-id>.execute-api.<region>.amazonaws.com/<env>"
+ws = websocket.WebSocketApp(
+    websocket_url,
+    on_open=on_open,
+    on_message=on_message,
+    on_error=on_error,
+    on_close=on_close
+)
+
+ws.run_forever()
 ```
-
-**Note:** Replace `<api-id>`, `<region>`, and `<env>` with your actual API Gateway values. The endpoint is also output by CloudFormation as `AmbulanceAlertApiEndpoint`.
 
 ### Monitoring Vehicle Acknowledgments
 
@@ -348,11 +402,17 @@ client.client.on_message = on_message
 
 ### Run All Tests
 ```bash
-# Run comprehensive Lambda function test
-python test_lambda_alert_processing.py
+# Test WebSocket dashboard communication
+python tests/test_dashboard_data.py
 
-# Run MQTT communication test
-python subscribe_and_publish.py
+# Test combined data flow
+python tests/test_combined_data.py
+
+# Test end-to-end system flow
+python tests/test_end_to_end.py
+
+# Test MQTT communication
+python tests/subscribe_and_publish.py
 
 # Run individual test suites
 pytest tests/
@@ -382,6 +442,7 @@ aws cloudwatch get-metric-statistics \
 - IoT message count
 - DynamoDB capacity units
 - Lambda invocations
+- WebSocket API Gateway metrics
 
 ### Free Tier Monitoring
 The system includes built-in Free Tier monitoring:
@@ -412,6 +473,15 @@ The system includes built-in Free Tier monitoring:
 | b5712103-efbd-47e9-83a9-21783229df51  | test-driver-id                        | 2025-06-23T22:15:58Z   | 30.0444,31.2357,Cairo, Egypt  | Driver fell asleep   | true      | ...         |
 | cacae107-7aaf-83bd-1b2a-e01e5b4bbd7d  | fac15154-8712-af70-5b23-f3fd61e3db89  | 2025-06-23T22:31:12Z   | 30.0444,31.2357,Cairo, Egypt  | Driver fell asleep   | true      | ...         |
 
+### websocket-connections-dev Table
+- **Primary Key:** `connection_id` (String)
+- **Columns:** connection_id, user_id, timestamp, ttl
+
+| connection_id                         | user_id                               | timestamp              | ttl         |
+|---------------------------------------|---------------------------------------|------------------------|-------------|
+| abc123def456                          | ambulance-unit-001                    | 2025-01-18T10:30:00Z   | ...         |
+| xyz789uvw012                          | emergency-center-002                  | 2025-01-18T10:35:00Z   | ...         |
+
 ## Querying DynamoDB for Data
 
 **Get all drivers:**
@@ -421,6 +491,10 @@ aws dynamodb scan --table-name drivers-dev --select ALL_ATTRIBUTES
 **Get all alerts:**
 ```bash
 aws dynamodb scan --table-name drowsiness_alerts-dev --select ALL_ATTRIBUTES
+```
+**Get active WebSocket connections:**
+```bash
+aws dynamodb scan --table-name websocket-connections-dev --select ALL_ATTRIBUTES
 ```
 **Get a specific driver by ID:**
 ```bash
@@ -439,8 +513,10 @@ aws dynamodb get-item --table-name drowsiness_alerts-dev --key '{"alert_id": {"S
   - Make sure the IoT Rule is enabled and points to the correct Lambda
 - **Lambda code not updating:**
   - CloudFormation must be updated and the stack must finish updating for inline Lambda code changes to take effect
-- **API Gateway resource conflicts:**
-  - Use unique path parts (e.g., `driver-profile` instead of `driver`) to avoid naming conflicts
+- **WebSocket connection issues:**
+  - Check WebSocket API Gateway logs in CloudWatch
+  - Verify WebSocket Lambda functions have proper permissions
+  - Ensure WebSocket connections table exists and is accessible
 - **Data not joined:**
   - Ensure the driver ID in the alert matches an existing driver profile in DynamoDB
 
@@ -470,7 +546,7 @@ mypy src/ tests/
   - Retrieves driver profile from DynamoDB using driver_id
   - Combines alert and driver data
   - Stores simplified alert in DynamoDB (alert_id, driver_id, timestamp, location, message, processed, ttl)
-  - **Sends combined data to ambulance dashboard via HTTP POST to API Gateway endpoint**
+  - **Sends combined data to ambulance dashboard via WebSocket connections**
   - Sends acknowledgment back to vehicle (`vehicle/alerts/ack`)
 
 ### update_profile_handler
@@ -488,19 +564,31 @@ mypy src/ tests/
   - Updates DynamoDB
   - Publishes to IoT Core
 
-## Ambulance Dashboard HTTP Endpoint
+### WebSocket Lambda Functions
+- **WebSocketAlertFunction**: Sends real-time alerts to ambulance dashboard via WebSocket
 
-The ambulance dashboard receives combined alert and driver data via an HTTP POST endpoint:
+> **Note:** All ambulance alert delivery is performed in real-time via WebSocket connections. HTTP is not used for ambulance alert delivery in this system.
 
-**CloudFormation Output:**
+## WebSocket API Gateway
 
+The ambulance dashboard receives real-time alerts via WebSocket connections:
+
+**CloudFormation Outputs:**
 ```
-AmbulanceAlertApiEndpoint = https://<api-id>.execute-api.<region>.amazonaws.com/<env>/ambulance-alert
+WebSocketApiEndpoint = wss://<api-id>.execute-api.<region>.amazonaws.com/<env>
+WebSocketConnectionsTableName = websocket-connections-dev
 ```
+
+**WebSocket Routes:**
+- `$connect`: Handle new WebSocket connections
+- `$disconnect`: Handle WebSocket disconnections
+- `$default`: Handle default WebSocket messages
 
 **How to use:**
-- The backend/dashboard should listen for POST requests at this endpoint.
-- Each POST contains a JSON body with the combined alert and driver info as shown above.
+- The ambulance dashboard should establish WebSocket connections to the endpoint
+- Real-time alerts will be pushed to all connected clients
+- Each alert contains combined alert and driver information
+- Connections are automatically managed and cleaned up
 
 ## Contributing
 
